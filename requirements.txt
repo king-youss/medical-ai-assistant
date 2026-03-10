@@ -1,0 +1,6 @@
+streamlit
+spacy
+ortools
+pandas
+pydantic
+ollama
