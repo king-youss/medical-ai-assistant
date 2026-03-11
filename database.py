@@ -43,6 +43,18 @@ def init_db():
     conn.commit()
     conn.close()
 
+def log_triage(raw_text, category, description, score, source):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    extracted = f"category={category}; score={score}; source={source}; description={description}"
+    cursor.execute(
+        "INSERT INTO triage_logs (raw_text, extracted_entities, category) VALUES (?, ?, ?)",
+        (raw_text, extracted, category)
+    )
+    conn.commit()
+    conn.close()
+
+
 if __name__ == "__main__":
     init_db()
     print("Database initialized.")

@@ -12,6 +12,7 @@ from google_calendar import (
     build_available_days
 )
 import database
+from email_service import send_confirmation_email, send_cancellation_email, send_reschedule_email
 
 
 # -------------------------------------------------
@@ -316,6 +317,8 @@ def prepare_slots_for_booking(duration, reason, appt_type):
 def run_triage_flow(symptom_message: str):
     category, description, chat_message, score, source = triage_request(symptom_message)
 
+    database.log_triage(symptom_message, category, description, score, source)
+
     if category == "URGENCY":
         st.session_state.messages.append({
             "role": "assistant",
@@ -342,6 +345,23 @@ def run_triage_flow(symptom_message: str):
             "role": "assistant",
             "content": f"{chat_message} Choisissez d’abord un jour, puis un créneau."
         })
+        if category == "ANALYSIS_NEEDED":
+            consignes = (
+                "\n\n**Consignes de préparation pour vos analyses :**\n"
+                "- Présentez-vous **à jeun** depuis au moins 12 heures (eau autorisée).\n"
+                "- Évitez l'alcool et le tabac 24h avant le prélèvement.\n"
+                "- Apportez votre **carte Vitale** et votre **ordonnance** si vous en avez une.\n"
+                "- Si vous prenez un traitement, ne l'arrêtez pas sauf avis médical.\n"
+                "\n**Laboratoires à proximité :**\n"
+                "- Laboratoire BioMédical Centre — 12 rue de la Santé\n"
+                "- Labo Analyse Plus — 45 avenue Pasteur\n"
+                "- Centre de Biologie Médicale — 8 place de la République\n"
+                "\n_Vous pouvez effectuer vos analyses dans le laboratoire de votre choix._"
+            )
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": consignes
+            })
         st.session_state.banner_message = ""
         st.session_state.banner_type = ""
     else:
@@ -381,7 +401,8 @@ defaults = {
     "confirmed_event_id": None,
     "confirmed_start_time": None,
     "pending_user_message": None,
-    "pending_processing": False
+    "pending_processing": False,
+    "patient_email": ""
 }
 
 for key, value in defaults.items():
@@ -590,9 +611,27 @@ if st.session_state.flow_state == "selected" and st.session_state.selected_slot:
         )
         st.session_state.banner_type = "success"
 
+        email_sent = False
+        if st.session_state.patient_email:
+            try:
+                email_sent = send_confirmation_email(
+                    to_email=st.session_state.patient_email,
+                    patient_name=st.session_state.patient_name,
+                    start_time=st.session_state.selected_slot,
+                    duration=st.session_state.pending_duration,
+                    appt_type=st.session_state.pending_type,
+                    reason=st.session_state.pending_reason
+                )
+            except Exception:
+                email_sent = False
+
+        confirm_msg = "Votre rendez-vous est confirmé."
+        if email_sent:
+            confirm_msg += f" Un e-mail de confirmation a été envoyé à {st.session_state.patient_email}."
+
         st.session_state.messages.append({
             "role": "assistant",
-            "content": "Votre rendez-vous est confirmé."
+            "content": confirm_msg
         })
 
         st.rerun()
@@ -611,6 +650,16 @@ if st.session_state.flow_state == "confirmed" and st.session_state.confirmed_eve
 
             if st.session_state.confirmed_start_time:
                 delete_local_appointment(st.session_state.confirmed_start_time)
+
+            if st.session_state.patient_email and st.session_state.confirmed_start_time:
+                try:
+                    send_cancellation_email(
+                        to_email=st.session_state.patient_email,
+                        patient_name=st.session_state.patient_name,
+                        start_time=st.session_state.confirmed_start_time
+                    )
+                except Exception:
+                    pass
 
             st.session_state.messages.append({
                 "role": "assistant",
@@ -728,6 +777,18 @@ if st.session_state.flow_state == "move_selected" and st.session_state.selected_
                 duration=st.session_state.pending_duration
             )
 
+        if st.session_state.patient_email and old_start:
+            try:
+                send_reschedule_email(
+                    to_email=st.session_state.patient_email,
+                    patient_name=st.session_state.patient_name,
+                    old_start_time=old_start,
+                    new_start_time=st.session_state.selected_slot,
+                    duration=st.session_state.pending_duration
+                )
+            except Exception:
+                pass
+
         st.session_state.confirmed_start_time = st.session_state.selected_slot
         st.session_state.flow_state = "confirmed"
         st.session_state.banner_message = (
@@ -781,23 +842,41 @@ if st.session_state.pending_processing and st.session_state.pending_user_message
 
         extracted_name = extract_name(user_message)
         st.session_state.patient_name = extracted_name
-        st.session_state.flow_state = "ready"
+        st.session_state.flow_state = "ask_email"
         st.session_state.messages.append({
             "role": "assistant",
-            "content": f"Bonjour {st.session_state.patient_name}. Décrivez-moi maintenant votre demande."
+            "content": f"Bonjour {st.session_state.patient_name}. Quelle est votre adresse e-mail pour recevoir les confirmations ?"
         })
+        st.rerun()
+
+    if st.session_state.flow_state == "ask_email":
+        email = user_message.strip()
+        if "@" in email and "." in email:
+            st.session_state.patient_email = email
+            st.session_state.flow_state = "ready"
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": f"Merci. Décrivez-moi maintenant votre demande."
+            })
+        else:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "L'adresse saisie ne semble pas valide. Pouvez-vous réessayer ?"
+            })
         st.rerun()
 
     if st.session_state.waiting_name_for_symptoms:
         extracted_name = extract_name(user_message)
         st.session_state.patient_name = extracted_name
         st.session_state.waiting_name_for_symptoms = False
-        st.session_state.flow_state = "ready"
+        st.session_state.flow_state = "ask_email"
+        st.session_state.buffered_symptom_message = st.session_state.buffered_symptom_message  # keep it
 
         st.session_state.messages.append({
             "role": "assistant",
-            "content": f"Bonjour {st.session_state.patient_name}. Je m’occupe maintenant de votre demande."
+            "content": f"Bonjour {st.session_state.patient_name}. Quelle est votre adresse e-mail pour recevoir les confirmations ?"
         })
+        st.rerun()
 
         buffered_message = st.session_state.buffered_symptom_message
         st.session_state.buffered_symptom_message = ""
