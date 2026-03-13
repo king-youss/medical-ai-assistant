@@ -1,173 +1,254 @@
-# Documentation du code actuel — Medical AI Assistant
+# Documentation Technique — Medical AI Assistant
 
-_Date : 10 mars 2026_
+Date de mise à jour: 13 mars 2026
 
-## 1) Vue d’ensemble
+## 1) Vue d'ensemble actuelle
 
-Ce projet est une application **Streamlit** de triage médical local qui :
+Le projet est une application Streamlit de triage médical conversationnel.
 
-- récupère une description libre des symptômes d’un patient,
-- classe la demande via un moteur de triage (`URGENCY`, `ANALYSIS_NEEDED`, `STANDARD`),
-- propose automatiquement un créneau de rendez-vous,
-- stocke les données dans une base **SQLite**.
+Objectifs actuels du code:
+- analyser un message patient en texte libre,
+- classer la demande en `URGENCY`, `ANALYSIS_NEEDED` ou `STANDARD`,
+- proposer des créneaux de consultation en se basant sur Google Calendar,
+- confirmer, annuler ou déplacer des rendez-vous,
+- conserver une trace minimale des rendez-vous dans SQLite.
 
-L’objectif est de démontrer une architecture simple combinant :
+Le flux principal est aujourd'hui centré sur:
+- UI chat dans `app.py`,
+- triage LLM + fallback dans `triage_engine.py`,
+- disponibilité/booking Google dans `google_calendar.py`,
+- persistance locale dans `database.py`.
 
-- interface utilisateur web (`app.py`),
-- persistance (`database.py`),
-- logique de triage IA/règles (`triage_engine.py`),
-- planification de créneaux (`scheduler.py`).
+## 2) État des fichiers du dépôt
 
----
+- `app.py`: application Streamlit principale (chat, machine d'états, réservation Google).
+- `triage_engine.py`: extraction prénom, détection message symptômes, triage IA/fallback.
+- `google_calendar.py`: OAuth Google, lecture disponibilités, create/delete/move événements.
+- `database.py`: création du schéma SQLite (`patients`, `appointments`, `triage_logs`).
+- `email_service.py`: service SMTP HTML prêt, mais non branché dans `app.py` sur cette branche.
+- `scheduler.py`: scheduler local historique, non utilisé par `app.py` actuel.
+- `requirements.txt`: dépendances Python partielles.
+- `.env`: variables SMTP présentes localement.
+- `.gitignore`: ignore `credentials.json`, `token.json`, `medical_demo.db`, environnements Python.
 
-## 2) Structure des fichiers
+## 3) Analyse détaillée par module
 
-- `app.py` : point d’entrée Streamlit, interface et orchestration globale.
-- `database.py` : création/initialisation de la base SQLite et des tables.
-- `triage_engine.py` : classification des demandes via Ollama + fallback par règles.
-- `scheduler.py` : recherche du prochain créneau disponible.
-- `requirements.txt` : dépendances Python.
+### 3.1 `app.py`
 
----
+Rôle:
+- orchestrer le parcours utilisateur conversationnel,
+- piloter la logique métier de réservation,
+- appeler triage, calendrier Google et base locale.
 
-## 3) Détail des modules
+Points techniques majeurs:
+- Configuration Streamlit en layout centré.
+- CSS custom important (thème sombre + composants de sélection de jours/créneaux).
+- Fonctions DB locales:
+   - `save_appointment(...)`
+   - `delete_local_appointment(...)`
+   - `update_local_appointment(...)`
+- Utilitaires:
+   - `format_slot(...)`
+   - `slot_still_available(...)`
+   - `split_slots_by_period(...)`
+   - `render_slot_grid(...)`
+   - `prepare_slots_for_booking(...)`
+   - `run_triage_flow(...)`
 
-## `app.py`
+Machine d'états gérée via `st.session_state`:
+- `ask_name`
+- `ready`
+- `choose_day`
+- `waiting_slot`
+- `selected`
+- `confirmed`
+- `move_choose_day`
+- `move_waiting_slot`
+- `move_selected`
 
-Rôle principal : piloter l’application et relier tous les composants.
+Parcours utilisateur réel:
+1. AMI demande le prénom.
+2. Le patient décrit sa demande/ses symptômes.
+3. Le triage retourne la catégorie.
+4. Si `URGENCY`: message d'alerte, arrêt du flux de réservation.
+5. Sinon: récupération de créneaux Google (`build_google_available_slots_week`).
+6. Choix jour -> choix créneau -> confirmation.
+7. Création d'un événement Google + insertion locale SQLite.
+8. Actions post-confirmation: annuler ou déplacer.
 
-Fonctionnalités clés :
+Durées de rendez-vous:
+- `STANDARD`: 15 minutes
+- `ANALYSIS_NEEDED`: 20 minutes
 
-1. Configure la page Streamlit (`set_page_config`).
-2. Initialise la base au démarrage via `database.init_db()`.
-3. Lit les rendez-vous existants (`get_appointments`) avec `pandas.read_sql_query`.
-4. Sauvegarde les patients et rendez-vous (`save_appointment`).
-5. Affiche :
-   - une barre latérale « Agenda du Docteur »,
-   - un formulaire patient (nom + description symptômes),
-   - une section d’aide technique.
-6. Déclenche l’analyse via `triage_request(patient_msg)`.
-7. Applique une logique selon la catégorie :
-   - `URGENCY` : message d’alerte immédiate (pas de réservation),
-   - `ANALYSIS_NEEDED` : réservation de 20 min,
-   - `STANDARD` : réservation de 15 min.
-8. Utilise `find_available_slot(existing, duration)` pour trouver un créneau.
-9. Permet de réinitialiser l’agenda (suppression de `appointments` et `patients`).
+Observations importantes:
+- Pas d'import `email_service` dans cette version d'`app.py`.
+- Pas de collecte e-mail patient dans le chat.
+- Pas d'insert dans `triage_logs`.
+- Si `credentials.json` est absent, un `FileNotFoundError` peut remonter via `google_calendar.py`.
 
-Remarques techniques :
+### 3.2 `triage_engine.py`
 
-- Les dates de rendez-vous sont stockées en texte ISO (`slot.isoformat()`).
-- Chaque enregistrement crée un nouveau patient (pas de déduplication par nom/contact).
-- La variable `type` est utilisée comme nom de paramètre de fonction, ce qui masque le built-in Python `type` (fonctionnel ici, mais pas idéal).
+Rôle:
+- traitement NLP/LLM du message patient.
 
-## `database.py`
+Fonctions:
+- `extract_name(text)`: extraction du prénom (LLM puis fallback règles).
+- `looks_like_symptom_message(text)`: heuristique mots-clés symptômes.
+- `triage_request(text)`: classification + message utilisateur.
 
-Rôle principal : gérer le schéma de données SQLite.
+Détails du triage:
+- Modèle utilisé: `mistral-nemo` (`MODEL_NAME`).
+- Format de réponse demandé au LLM:
+   - `CATEGORY`
+   - `DESCRIPTION`
+   - `CHAT`
+   - `SCORE`
+- Valeur de retour:
+   - `(category, description, chat_message, score, source)`
+- Fallback robuste si l'appel Ollama échoue (listes de mots-clés urgence/analyses).
 
-Constante :
+### 3.3 `google_calendar.py`
 
-- `DB_PATH = "medical_demo.db"`
+Rôle:
+- couche d'intégration Google Calendar.
 
-Fonction :
+Fonctions clés:
+- `get_calendar_service()` (OAuth via `credentials.json`/`token.json`)
+- `create_google_event(...)`
+- `delete_google_event(...)`
+- `move_google_event(...)`
+- `get_doctor_busy_slots_for_day(...)`
+- `build_google_available_slots_for_day(...)`
+- `build_google_available_slots_week(...)`
+- `build_available_days(...)`
 
-- `init_db()` crée les tables si elles n’existent pas :
-  - `patients` (`id`, `name`, `contact`),
-  - `appointments` (`id`, `patient_id`, `start_time`, `duration`, `reason`, `type`),
-  - `triage_logs` (`id`, `raw_text`, `extracted_entities`, `category`, `timestamp`).
+Caractéristiques:
+- plage de travail: 09:00 -> 17:00,
+- pas d'incrément: 15 min,
+- jours ouvrables uniquement (lundi-vendredi),
+- horizon par défaut: 14 jours.
 
-Remarques techniques :
+Limitation actuelle:
+- l'événement est créé avec le médecin uniquement dans `attendees`.
+- le patient n'est pas ajouté comme participant calendrier.
 
-- La table `triage_logs` est créée mais **non alimentée** dans l’état actuel du code.
-- Les clés étrangères existent au niveau schéma mais la logique applicative ne gère pas de contraintes avancées (unicité, cascade, etc.).
+### 3.4 `database.py`
 
-## `triage_engine.py`
+Rôle:
+- initialiser le schéma SQLite `medical_demo.db`.
 
-Rôle principal : classer le texte patient dans une catégorie de triage.
+Tables:
+- `patients(id, name, contact)`
+- `appointments(id, patient_id, start_time, duration, reason, type)`
+- `triage_logs(id, raw_text, extracted_entities, category, timestamp)`
 
-Fonction :
+Limitation actuelle:
+- `triage_logs` n'est pas alimentée par `app.py`.
 
-- `triage_request(text)`
+### 3.5 `email_service.py`
 
-Comportement :
+Rôle:
+- fournir des fonctions d'envoi SMTP HTML.
 
-1. Construit un prompt demandant une sortie parmi :
-   - `URGENCY`
-   - `ANALYSIS_NEEDED`
-   - `STANDARD`
-2. Appelle `ollama.chat` avec le modèle `llama3.1:latest`.
-3. Interprète le texte retourné :
-   - contient `URGENCY` → catégorie urgence,
-   - contient `ANALYSIS_NEEDED` → analyses recommandées,
-   - sinon → standard.
-4. En cas d’exception (Ollama indisponible, erreur réseau, etc.), applique des règles fallback :
-   - si le texte contient `poitrine` → `URGENCY`,
-   - si contient `analyse` ou `prise de sang` → `ANALYSIS_NEEDED`,
-   - sinon → `STANDARD`.
+Fonctions:
+- `send_confirmation_email(...)`
+- `send_cancellation_email(...)`
+- `send_reschedule_email(...)`
 
-Valeur retournée : tuple `(category, description, score, source)`.
+Configuration:
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` via variables d'environnement.
 
-## `scheduler.py`
+État actuel:
+- module techniquement prêt,
+- non utilisé par `app.py` dans cette branche.
 
-Rôle principal : proposer le premier créneau libre dans la journée.
+### 3.6 `scheduler.py`
 
-Fonction :
+Rôle:
+- ancien scheduler local de créneaux sur la journée.
 
-- `find_available_slot(existing, duration)`
+État actuel:
+- présent dans le dépôt,
+- non utilisé par `app.py` (remplacé par la logique Google Calendar).
 
-Paramètres :
+## 4) Flux d'exécution global (branche actuelle)
 
-- `existing` : liste de tuples `(start_time_iso, duration_minutes)`.
-- `duration` : durée demandée du nouveau rendez-vous en minutes.
+1. Démarrage Streamlit et init DB.
+2. Conversation patient (nom, puis description).
+3. Triage IA/fallback.
+4. Si urgence -> message d'alerte.
+5. Sinon -> calcul des disponibilités Google.
+6. Sélection jour/créneau.
+7. Confirmation:
+    - création événement Google,
+    - sauvegarde locale dans SQLite.
+8. Option d'annulation ou de déplacement.
 
-Algorithme :
+## 5) Dépendances et exécution
 
-1. Définit une plage de travail **09:00 → 18:00** pour la date courante.
-2. Balaye les créneaux toutes les **15 minutes**.
-3. Vérifie les chevauchements avec les rendez-vous existants.
-4. Retourne le premier créneau valide en ISO (`.isoformat()`), sinon `None`.
+Contenu actuel de `requirements.txt`:
+- `streamlit`
+- `spacy`
+- `ortools`
+- `pandas`
+- `pydantic`
+- `ollama`
 
----
+Écart technique important:
+- `google_calendar.py` utilise des paquets Google non déclarés dans `requirements.txt`:
+   - `google-api-python-client`
+   - `google-auth`
+   - `google-auth-oauthlib`
+   - `google-auth-httplib2`
 
-## 4) Flux d’exécution global
+Prérequis runtime:
+- fichier `credentials.json` requis pour OAuth Google,
+- `token.json` généré après autorisation,
+- instance Ollama disponible localement avec le modèle `mistral-nemo`.
 
-1. L’utilisateur saisit nom + symptômes.
-2. Le triage classe la demande (`triage_engine`).
-3. L’interface affiche le niveau de réponse.
-4. Si non urgent, le scheduler cherche un slot.
-5. Le rendez-vous est enregistré en base SQLite.
-6. L’agenda affiché dans la sidebar est rafraîchi.
+## 6) Écarts avec la roadmap discutée précédemment
 
----
+### Implémenté et opérationnel
+- Interface conversationnelle Streamlit.
+- Triage IA + fallback règles.
+- Branche urgence avec arrêt du booking.
+- Réservation/annulation/déplacement via Google Calendar.
+- Persistance locale des rendez-vous.
+- Distinction 15 min / 20 min.
 
-## 5) Dépendances (`requirements.txt`)
+### Implémenté dans le dépôt mais non branché
+- Service e-mail complet (`email_service.py`).
+- Variables SMTP locales (`.env`).
 
-- `streamlit` : interface web interactive.
-- `spacy` : présent dans les dépendances, non utilisé directement dans le code actuel.
-- `ortools` : présent dans les dépendances, non utilisé directement dans le code actuel.
-- `pandas` : lecture tabulaire des rendez-vous depuis SQLite.
-- `pydantic` : présent dans les dépendances, non utilisé directement dans le code actuel.
-- `ollama` : appel au modèle local pour le triage.
+### Non implémenté sur cette branche
+- Historisation active dans `triage_logs`.
+- Collecte structurée de l'e-mail patient dans le chat.
+- Envoi automatique des e-mails (confirmation/annulation/déplacement) depuis `app.py`.
+- Consignes patient et orientation labo affichées dans `app.py` pour `ANALYSIS_NEEDED`.
+- Ajout du patient dans `attendees` Google Calendar.
+- Gestion propre de l'absence de `credentials.json` (actuellement crash possible).
 
----
+## 7) Risques techniques actuels
 
-## 6) Limites actuelles et points d’amélioration
+- Risque d'échec au runtime si `credentials.json` absent.
+- Risque d'échec environnement si dépendances Google non installées.
+- Risque de dette de maintenance car `documentation.md` précédente ne décrivait pas l'état réel.
+- Risque sécurité: secrets SMTP potentiellement exposés si `.env` est partagé.
+- Risque qualité données: patients dupliqués (pas de déduplication ni contact obligatoire).
 
-- Pas de validation métier avancée des entrées patient.
-- Déduplication patient absente (insert systématique).
-- `triage_logs` non exploité pour historiser les analyses.
-- Dépendances potentiellement inutilisées (`spacy`, `ortools`, `pydantic`) dans la version actuelle.
-- Gestion des horaires sur la journée courante uniquement.
-- Pas de tests automatisés fournis dans le dépôt actuel.
+## 8) Recommandations prioritaires
 
----
+1. Ajouter la gestion d'erreur explicite pour Google Calendar (`credentials.json` manquant).
+2. Brancher `email_service.py` dans `app.py` + collecte e-mail patient.
+3. Alimenter `triage_logs` à chaque analyse.
+4. Compléter `requirements.txt` avec les paquets Google.
+5. Ajouter le patient dans `attendees` pour synchronisation agenda.
+6. Mettre en place des tests de non-régression sur le flux principal (triage -> slot -> confirmation).
 
-## 7) Résumé
+## 9) Résumé exécutif
 
-Le code actuel fournit une base fonctionnelle de démonstration :
+Le code de la branche actuelle fournit une base fonctionnelle solide pour un assistant médical conversationnel avec Google Calendar.
 
-- triage IA avec fallback,
-- prise de rendez-vous automatique simple,
-- persistance locale SQLite,
-- interface Streamlit claire.
+Le coeur produit fonctionne, mais la documentation précédente était en décalage et plusieurs briques utiles existent sans être reliées au flux principal (notamment e-mail et logging triage).
 
-L’architecture est lisible et modulaire, avec une bonne séparation entre UI, triage, planification et base de données, ce qui facilite les évolutions futures.
+La priorité immédiate est de sécuriser l'exécution (gestion erreurs Google + dépendances) puis de reconnecter les fonctionnalités déjà codées mais inactives.
